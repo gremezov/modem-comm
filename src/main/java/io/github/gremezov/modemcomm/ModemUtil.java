@@ -52,32 +52,4 @@ public class ModemUtil{
 
 		return serialRead(port).split("\\R");	// split based on newline
 	}
-
-	public static int checkResponseOK(SerialPort modemport){
-
-		// function checkResponseOK
-		// Returns 0 if modem responds with an OK, -1 if ERROR, and -2 if timeout occurs
-		// before any recognizeable modem response is detected.
-
-		int timeout = 5000; // in milliseconds
-		long cmd_sent_time = System.nanoTime();
-
-		while(true){
-			if(modemport.bytesAvailable() > 0){
-				String[] input_lines = serialReadLines(modemport);
-				if(input_lines.length > 0){
-					for(String s : input_lines){
-						if(s.length() >= 2 && s.substring(0,2).equals("OK")){
-							return 0;
-						} else if(s.length() >= 5 && s.substring(0,5).equals("ERROR")){
-							return -1;
-						}
-					}
-				}
-			}
-			if((System.nanoTime()-cmd_sent_time)/1000000 > timeout){
-				return -2;
-			}
-		}
-	}
 }
