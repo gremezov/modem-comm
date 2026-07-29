@@ -1,6 +1,24 @@
-/* 	Notes
-		- Implement GUI serial terminal as a separate window
-			- choose port and baud rate in main window, launch terminal in separate window
+/* 	TODO
+		-	redesign error reporting mechanisms so that error printing is done on the high level, not in individual functions
+				-	implement standard in-program error codes (< 0)
+				-	add exit_after checking to logError and exit after JOptionPane returns OK in GUI?
+		-	recheck sms sending timeout to match with modem's real timeout, because sometimes messages do get through
+			even after modem-comm reports timeout
+		-	implement port scanning for modem in GUI
+		- 	implement USSD "user reply required" functionality
+		-	rewrite the mult-panel initialization and other bulk graphic initialization with arrays and loops
+
+	Bugs
+		-	forcing (with sudo) to open port already used for internet communication when running modem port scan
+			causes the scan to hang at that port, despite timeouts
+		-	if running standalone graphics terminal from command line and "no port selected" error occurs, graphical
+			window will close instantly upon OKing the error message but the command line will lag before exiting
+				-	most likely caused due to threads spawned by dialog box of logError still running and and not letting
+					program die (can be solved by System.exit upon returning from startSerialTerminal (but only if dialog box
+					is not on EDT, because being on EDT would mean that startSerialTerminal would return before "OK" is pressed))
+				-	can be replicated by having a dialog box being the last thing the program runs and not calling System.exit
+		-	running with modem-comm -g -t -p <non-existant-terminal> will not print errors because program will exit in port checking
+			logic section before logError will have the chance to display the JOptionPane
 */
 
 package io.github.gremezov.modemcomm;
@@ -11,6 +29,7 @@ import com.fazecast.jSerialComm.SerialPortEvent;
 import org.apache.commons.cli.*;
 import javax.swing.*;
 import javax.swing.JOptionPane;
+import javax.swing.text.DefaultCaret;
 import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
@@ -24,6 +43,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
 import java.util.concurrent.ExecutionException;
 import java.util.Scanner;
+import java.util.List;
 
 public class Main {
 
@@ -32,9 +52,8 @@ public class Main {
 	private static boolean verbose_output = false;
 
 	private static SerialPort modemport = null;	// set to null temporary before initializing it below
-
-	// specifies the baud rate used for all operations with serial ports, except for the GUI serial terminal where this value may be over-ridden
-	private static int baudrate = 115200;
+	private static int baudrate = 115200;	// default baud rate
+	private static String terminal_end_chars = "\r";	// default ending characters to use with the serial terminal
 
 	public static void main(String[] args) {
 
@@ -44,7 +63,8 @@ public class Main {
 		options.addOption(Option.builder("u").longOpt("ussd").argName("code").hasArg().desc("send a USSD code").build());
 		options.addOption(Option.builder("p").longOpt("port").argName("port-name").hasArg().desc("manually select the modem's serial port").build());
 		options.addOption(Option.builder("b").longOpt("baud").argName("baud-rate").hasArg().desc("specify the baud rate").build());
-		//options.addOption(Option.builder("m").longOpt("sms").argName("phone-number message").numberOfArgs(2).desc("send an SMS").build());
+		options.addOption(Option.builder("m").longOpt("sms").argName("phone-number> <message").numberOfArgs(2).desc("send an SMS").build());
+		options.addOption(Option.builder("e").longOpt("end-chars").argName("characters").hasArg().desc("ending characters to use with the serial terminal").build());
 		options.addOption("a", "auto-select-port", false, "select a modem port by scanning all available serial ports");
 		options.addOption("s", "scan", false, "scan all available serial ports for useable modems");
 		options.addOption("h", "help", false, "show a help message");
@@ -70,6 +90,9 @@ public class Main {
 			if(cmdline.hasOption("verbose")){
 				verbose_output = true;
 			}
+			if(cmdline.hasOption("end-chars")){
+				terminal_end_chars = cmdline.getOptionValue("end-chars").replace("\\n", "\n").replace("\\r", "\r");
+			}
 			if(cmdline.hasOption("scan")){
 				SerialPort[] modemPorts = scanForModemPorts();
 				if(modemPorts.length > 0){
@@ -93,9 +116,11 @@ public class Main {
 
 			if(cmdline.hasOption("auto-select-port")){
 				if(is_gui){
-					JOptionPane.showMessageDialog(null, "Press \"Ok\" to scan serial ports for a modem", "run scan", JOptionPane.PLAIN_MESSAGE);
+					SwingUtilities.invokeLater(() -> {
+						JOptionPane.showMessageDialog(null, "Scanning serial ports for a modem...", "scan running", JOptionPane.PLAIN_MESSAGE);
+					});
 				} else{
-					System.out.println("Scanning serial ports for a modem...");
+					logVerboseOutput("Scanning serial ports for a modem...\n");
 				}
 				SerialPort[] modemPorts = scanForModemPorts();
 				if(modemPorts == null){
@@ -107,15 +132,17 @@ public class Main {
 				}
 				modemport = modemPorts[0];
 				if(is_gui){
-					JOptionPane.showMessageDialog(null, "Selecting port "+modemport.getSystemPortName(), "modem selected", JOptionPane.PLAIN_MESSAGE);
+					SwingUtilities.invokeLater(() -> {
+						JOptionPane.showMessageDialog(null, "Selecting port "+modemport.getSystemPortName(), "modem selected", JOptionPane.PLAIN_MESSAGE);
+					});
 				} else{
-					System.out.println("Selecting port "+modemport.getSystemPortName()+"\n");
+					logVerboseOutput("Selecting port "+modemport.getSystemPortName()+"\n");
 				}
 			} else if(cmdline.hasOption("port")){
 				String manual_port_name = cmdline.getOptionValue("port");
 
 				// getCommPort only takes the port name not the full path so on linux, for example, ttyUSB0 must be passed instead of /dev/ttyUSB0
-				if(manual_port_name.substring(0,5).equals("/dev/")){
+				if(manual_port_name.length() >= 5 && manual_port_name.substring(0,5).equals("/dev/")){
 					manual_port_name = manual_port_name.substring(5);
 				}
 
@@ -134,8 +161,8 @@ public class Main {
 			}
 
 			if(cmdline.hasOption("terminal")){
-				if(startSerialTerminal(modemport, baudrate, "\r\n") == -1){
-					if(!is_gui) System.exit(1);
+				if(startSerialTerminal(modemport, baudrate, terminal_end_chars) == -1){
+					if(!is_gui) System.exit(1);	// rewrite to exit if error in any case, gui or not. if no error, do nothing
 				} else{
 					if(!is_gui) System.exit(0);
 				}
@@ -145,10 +172,18 @@ public class Main {
 				String resp = startSendReceiveUSSD(modemport, cmdline.getOptionValue("ussd"));
 				if(resp == null){
 					System.exit(1);
-				} else {
-					System.out.println(resp);
-					System.exit(0);
 				}
+				System.out.println(resp);
+				System.exit(0);
+			}
+			if(cmdline.hasOption("sms") && !is_gui){
+				String[] opts = cmdline.getOptionValues("sms");
+				if(opts.length < 2){
+					logError("Error: SMS message not given.\n");
+					System.exit(1);
+				}
+				startSendSMS(modemport, opts[0], opts[1]);
+				System.exit(0);
 			}
 		} catch (ParseException e){
 			logError("Error: Failed to parse command-line arguments. Reason: "+e.getMessage()+"\n");
@@ -169,6 +204,7 @@ public class Main {
 	private static JPanel menuPanel;
 	private static JButton homeMenuButton;
 	private static JButton USSDMenuButton;
+	private static JButton SMSMenuButton;
 	private static JButton terminalMenuButton;
 
 	// Home screen
@@ -178,20 +214,26 @@ public class Main {
 
 	// USSD screen
 	private static JPanel USSDPanel;
-	private static JPanel USSDSubPanel1;
-	private static JPanel USSDSubPanel2;
+	private static JPanel USSDPanelBox;
 	private static JLabel USSDLabel;
 	private static JTextField USSDInputField;
 	private static JButton USSDSendButton;
 	private static JTextArea USSDReplyArea;
 	private static JScrollPane USSDReplyAreaScrollPane;
 
+	// SMS screen
+	private static JPanel SMSPanel;
+	private static JPanel SMSPanelBox;
+	private static JLabel SMSNumberLabel;
+	private static JTextField SMSNumberInputField;
+	private static JLabel SMSTextAreaLabel;
+	private static JTextArea SMSTextArea;
+	private static JScrollPane SMSTextAreaScrollPane;
+	private static JButton SMSSendButton;
+
 	// terminal screen
 	private static JPanel terminalPanel;
-	private static JPanel terminalSubPanel1;
-	private static JPanel terminalSubPanel2;
-	private static JPanel terminalSubPanel3;
-	private static JPanel terminalSubPanel4;
+	private static JPanel terminalPanelBox;
 	private static JLabel terminalPortLabel;
 	private static JComboBox<String> terminalPortSelectorComboBox;
 	private static JLabel terminalBaudLabel;
@@ -219,15 +261,13 @@ public class Main {
 
 		frame = new JFrame("modem-comm");
 		frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-		frame.setSize(600,400);
-		frame.setLocationRelativeTo(null);	// centers the window
 
 		/* Home */
 
 		homePanel = new JPanel();
 		homePanel.setBackground(Color.LIGHT_GRAY);
 
-		homePortLabel = new JLabel("Select modem port:");
+		homePortLabel = new JLabel("Modem Port:");
 		homePortLabel.setFont(new Font("Arial", Font.BOLD, 14));
 
 		homePortSelectorComboBox = new JComboBox<>(port_names);
@@ -251,14 +291,14 @@ public class Main {
 
 		/* USSD */
 
-		USSDPanel = new JPanel();
-		USSDPanel.setLayout(new BoxLayout(USSDPanel, BoxLayout.Y_AXIS));
-		USSDSubPanel1 = new JPanel();
-		USSDSubPanel1.setBackground(Color.LIGHT_GRAY);
-		USSDSubPanel2 = new JPanel();
-		USSDSubPanel2.setBackground(Color.LIGHT_GRAY);
+		USSDPanel = new JPanel(new BorderLayout());
+		USSDPanel.setBackground(Color.LIGHT_GRAY);
 
-		USSDLabel = new JLabel("Enter a USSD code:"/*, SwingConstants.CENTER*/);
+		USSDPanelBox = new JPanel();
+		USSDPanelBox.setLayout(new BoxLayout(USSDPanelBox, BoxLayout.Y_AXIS));
+		USSDPanelBox.setBackground(USSDPanel.getBackground());
+
+		USSDLabel = new JLabel("USSD Code:");
 		USSDLabel.setFont(new Font("Arial", Font.BOLD, 14));
 
 		USSDInputField = new JTextField(20);
@@ -273,53 +313,136 @@ public class Main {
 		USSDReplyArea.setLineWrap(true);
 		USSDReplyArea.setWrapStyleWord(true);
 
+		// make text area auto-scoll down when data overflows
+		DefaultCaret USSDReplyAreaCaret = (DefaultCaret) USSDReplyArea.getCaret();
+		USSDReplyAreaCaret.setUpdatePolicy(DefaultCaret.ALWAYS_UPDATE);
+
 		USSDReplyAreaScrollPane = new JScrollPane(USSDReplyArea);
 
 		USSDSendButton.addActionListener(e -> {
 			String input = USSDInputField.getText();
-			if(!input.equals("")){
+			if(input.equals("")){
+				logError("Error: Please input the USSD code.");
+			} else {
 				startSendReceiveUSSD(modemport, input);
 			}
 		});
 
-		USSDSubPanel1.add(USSDLabel);
-		USSDSubPanel1.add(USSDInputField);
-		USSDSubPanel1.add(USSDSendButton);
-		USSDSubPanel2.add(USSDReplyAreaScrollPane);
-		USSDPanel.add(USSDSubPanel1);
-		USSDPanel.add(USSDSubPanel2);
+		JPanel up1 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		up1.add(USSDLabel);
+		up1.setBackground(USSDPanel.getBackground());
+
+		JPanel up2 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		up2.add(USSDInputField);
+		up2.setBackground(USSDPanel.getBackground());
+		up2.add(USSDSendButton);
+
+		JPanel up3 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		up3.add(USSDReplyAreaScrollPane);
+		up3.setBackground(USSDPanel.getBackground());
+
+		USSDPanelBox.add(up1);
+		USSDPanelBox.add(up2);
+		USSDPanelBox.add(up3);
+
+		USSDPanel.add(USSDPanelBox, BorderLayout.PAGE_START);
+
+		/* SMS */
+
+		SMSPanel = new JPanel(new BorderLayout());
+		SMSPanel.setBackground(Color.LIGHT_GRAY);
+
+		SMSPanelBox = new JPanel();
+		SMSPanelBox.setLayout(new BoxLayout(SMSPanelBox, BoxLayout.Y_AXIS));
+		SMSPanelBox.setBackground(SMSPanel.getBackground());
+
+		SMSNumberLabel = new JLabel("Recipient Phone Number:");
+		SMSNumberLabel.setFont(new Font("Arial", Font.BOLD, 14));
+
+		SMSNumberInputField = new JTextField(20);
+		SMSNumberInputField.setFont(new Font("Arial", Font.PLAIN, 14));
+
+		SMSTextAreaLabel = new JLabel("Message:");
+		SMSTextAreaLabel.setFont(new Font("Arial", Font.BOLD, 14));
+
+		SMSTextArea = new JTextArea(10, 30);
+		SMSTextArea.setFont(new Font("Arial", Font.PLAIN, 14));
+		SMSTextArea.setEditable(true);
+		SMSTextArea.setLineWrap(true);
+		SMSTextArea.setWrapStyleWord(true);
+
+		SMSTextAreaScrollPane = new JScrollPane(SMSTextArea);
+
+		SMSSendButton = new JButton("Send");
+		SMSSendButton.setFont(new Font("Arial", Font.BOLD, 14));
+
+		SMSSendButton.addActionListener(e -> {
+			String number = SMSNumberInputField.getText();
+			String message = SMSTextArea.getText();
+			if(number.equals("")){
+				logError("Error: Please input a recipient phone number.");
+			} else if(message.equals("")){
+				logError("Error: Please input a message.");
+			} else{
+				startSendSMS(modemport, number, message);
+			}
+		});
+
+		JPanel sp1 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		sp1.add(SMSNumberLabel);
+		sp1.setBackground(SMSPanel.getBackground());
+
+		JPanel sp2 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		sp2.add(SMSNumberInputField);
+		sp2.setBackground(SMSPanel.getBackground());
+
+		JPanel sp3 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		sp3.add(SMSTextAreaLabel);
+		sp3.setBackground(SMSPanel.getBackground());
+
+		JPanel sp4 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		sp4.add(SMSTextAreaScrollPane);
+		sp4.setBackground(SMSPanel.getBackground());
+
+		JPanel sp5 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		sp5.add(SMSSendButton);
+		sp5.setBackground(SMSPanel.getBackground());
+
+		SMSPanelBox.add(sp1);
+		SMSPanelBox.add(sp2);
+		SMSPanelBox.add(sp3);
+		SMSPanelBox.add(sp4);
+		SMSPanelBox.add(sp5);
+
+		SMSPanel.add(SMSPanelBox, BorderLayout.PAGE_START);
 
 		/* Terminal */
 
-		terminalPanel = new JPanel( new GridLayout(4, 1));
-		terminalSubPanel1 = new JPanel(new FlowLayout(FlowLayout.LEFT));
-		terminalSubPanel1.setBackground(Color.LIGHT_GRAY);
-		terminalSubPanel2 = new JPanel(new FlowLayout(FlowLayout.LEFT));
-		terminalSubPanel2.setBackground(Color.LIGHT_GRAY);
-		terminalSubPanel3 = new JPanel(new FlowLayout(FlowLayout.LEFT));
-		terminalSubPanel3.setBackground(Color.LIGHT_GRAY);
-		terminalSubPanel4 = new JPanel(new FlowLayout(FlowLayout.LEFT));
-		terminalSubPanel4.setBackground(Color.LIGHT_GRAY);
+		terminalPanel = new JPanel(new BorderLayout());
+		terminalPanel.setBackground(Color.LIGHT_GRAY);
 
-		terminalPortLabel = new JLabel("Select serial port:");
+		terminalPanelBox = new JPanel();
+		terminalPanelBox.setLayout(new BoxLayout(terminalPanelBox, BoxLayout.Y_AXIS));
+		terminalPanelBox.setBackground(terminalPanel.getBackground());
+
+		terminalPortLabel = new JLabel("Serial Port:");
 		terminalPortLabel.setFont(new Font("Arial", Font.BOLD, 14));
 
 		terminalPortSelectorComboBox = new JComboBox<>(port_names);
 
-		terminalBaudLabel = new JLabel("Enter baud rate:");
+		terminalBaudLabel = new JLabel("Baud Rate:");
 		terminalBaudLabel.setFont(new Font("Arial", Font.BOLD, 14));
 
-		terminalBaudInputField = new JTextField(10);
+		terminalBaudInputField = new JTextField(Integer.toString(baudrate), 10);	// set default baud rate to global baud rate
 		terminalBaudInputField.setFont(new Font("Arial", Font.PLAIN, 14));
-		terminalBaudInputField.setText(Integer.toString(baudrate));	// set default baud rate to global baud rate
 
-		terminalEndcharsLabel = new JLabel("Enter ending character sequence:");
+		terminalEndcharsLabel = new JLabel("Ending Character Sequence:");
 		terminalEndcharsLabel.setFont(new Font("Arial", Font.BOLD, 14));
 
-		terminalEndcharsInputField = new JTextField("\\r\\n", 10);
+		terminalEndcharsInputField = new JTextField(terminal_end_chars.replace("\r", "\\r").replace("\n", "\\n"), 10);
 		terminalEndcharsInputField.setFont(new Font("Arial", Font.PLAIN, 14));
 
-		terminalLaunchButton = new JButton("Launch serial terminal");
+		terminalLaunchButton = new JButton("Launch Serial Terminal");
 		terminalLaunchButton.setFont(new Font("Arial", Font.BOLD, 14));
 
 		terminalLaunchButton.addActionListener(e -> {
@@ -340,20 +463,46 @@ public class Main {
 				logError("Error: Baud rate must be an integer.");
 				return;
 			}
-			startSerialTerminal(SerialPort.getCommPort(selected_port_name), st_baudrate, terminalEndcharsInputField.getText().replace("\\n", "\n").replace("\\r", "\r"));
+			startSerialTerminal(SerialPort.getCommPort(selected_port_name), st_baudrate, terminalEndcharsInputField.getText().replace("\\r", "\r").replace("\\n", "\n"));
 		});
 
-		terminalSubPanel1.add(terminalPortLabel);
-		terminalSubPanel1.add(terminalPortSelectorComboBox);
-		terminalSubPanel2.add(terminalBaudLabel);
-		terminalSubPanel2.add(terminalBaudInputField);
-		terminalSubPanel3.add(terminalEndcharsLabel);
-		terminalSubPanel3.add(terminalEndcharsInputField);
-		terminalSubPanel4.add(terminalLaunchButton);
-		terminalPanel.add(terminalSubPanel1);
-		terminalPanel.add(terminalSubPanel2);
-		terminalPanel.add(terminalSubPanel3);
-		terminalPanel.add(terminalSubPanel4);
+		JPanel tp1 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		tp1.add(terminalPortLabel);
+		tp1.setBackground(terminalPanel.getBackground());
+
+		JPanel tp2 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		tp2.add(terminalPortSelectorComboBox);
+		tp2.setBackground(terminalPanel.getBackground());
+
+		JPanel tp3 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		tp3.add(terminalBaudLabel);
+		tp3.setBackground(terminalPanel.getBackground());
+
+		JPanel tp4 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		tp4.add(terminalBaudInputField);
+		tp4.setBackground(terminalPanel.getBackground());
+
+		JPanel tp5 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		tp5.add(terminalEndcharsLabel);
+		tp5.setBackground(terminalPanel.getBackground());
+
+		JPanel tp6 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		tp6.add(terminalEndcharsInputField);
+		tp6.setBackground(terminalPanel.getBackground());
+
+		JPanel tp7 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		tp7.add(terminalLaunchButton);
+		tp7.setBackground(terminalPanel.getBackground());
+
+		terminalPanelBox.add(tp1);
+		terminalPanelBox.add(tp2);
+		terminalPanelBox.add(tp3);
+		terminalPanelBox.add(tp4);
+		terminalPanelBox.add(tp5);
+		terminalPanelBox.add(tp6);
+		terminalPanelBox.add(tp7);
+
+		terminalPanel.add(terminalPanelBox, BorderLayout.PAGE_START);
 
 		/* menu */
 
@@ -376,6 +525,15 @@ public class Main {
 			cl.show(mainPanel, "USSDPanel");
 		});
 
+		SMSMenuButton = new JButton("SMS");
+		SMSMenuButton.setFont(new Font("Arial", Font.BOLD, 14));
+
+		SMSMenuButton.addActionListener(e -> {
+			CardLayout cl = (CardLayout)mainPanel.getLayout();
+			cl.show(mainPanel, "SMSPanel");
+			SMSSendButton.setText("Send");	// reload the "Send" text on screen reload to prevent it from permanently becomming "Sent" after an SMS is sent
+		});
+
 		terminalMenuButton = new JButton("Terminal");
 		terminalMenuButton.setFont(new Font("Arial", Font.BOLD, 14));
 
@@ -386,6 +544,7 @@ public class Main {
 
 		menuPanel.add(homeMenuButton);
 		menuPanel.add(USSDMenuButton);
+		menuPanel.add(SMSMenuButton);
 		menuPanel.add(terminalMenuButton);
 
 		/* main panel */
@@ -395,6 +554,7 @@ public class Main {
 
 		mainPanel.add(homePanel, "homePanel");
 		mainPanel.add(USSDPanel, "USSDPanel");
+		mainPanel.add(SMSPanel, "SMSPanel");
 		mainPanel.add(terminalPanel, "terminalPanel");
 
 		/* Frame final config */
@@ -403,6 +563,9 @@ public class Main {
 		frame.add(mainPanel, BorderLayout.CENTER);
 		frame.add(menuPanel, BorderLayout.NORTH);
 
+		//frame.pack();
+		frame.setSize(650,450);
+		frame.setLocationRelativeTo(null);	// centers the window
 		frame.setVisible(true);
 	}
 
@@ -421,7 +584,15 @@ public class Main {
 			SwingWorker sw1 = new SwingWorker<String, String>(){
 				@Override
 				protected String doInBackground(){
+					publish("Processing...");
 					return sendReceiveUSSD(modemport, ussd_code);
+				}
+
+				@Override
+				protected void process(List<String> chunks){
+					USSDSendButton.setText(chunks.get(chunks.size()-1));
+					USSDPanel.revalidate();
+					USSDPanel.repaint();
 				}
 
 				@Override
@@ -433,6 +604,7 @@ public class Main {
 						} else{
 							USSDReplyArea.setText(reply);
 						}
+						USSDSendButton.setText("Send");
 						USSDPanel.revalidate();
 						USSDPanel.repaint();
 					} catch (InterruptedException e){e.printStackTrace();} catch (ExecutionException e){e.printStackTrace();}
@@ -452,7 +624,7 @@ public class Main {
 		// GUI mode: returns -1 if error and 0 if everything ok.
 		// Terminal mode: returns -1 if error and never returns (runs in a loop) if everything ok.
 
-		if(modemport == null){
+		if(port == null){
 			logError("Error: No port selected.\n");
 			return -1;
 		}
@@ -513,8 +685,9 @@ public class Main {
 
 		JFrame stFrame = new JFrame("Serial Terminal - "+port.getSystemPortName());
 		if(is_standalone_gui_terminal) stFrame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-		stFrame.setSize(500, 300);
-		stFrame.setLocationRelativeTo(null);
+
+		JPanel stMainPanel = new JPanel();
+		stMainPanel.setLayout(new BoxLayout(stMainPanel, BoxLayout.Y_AXIS));
 
 		JTextArea stArea = new JTextArea(10, 30);
 		stArea.setFont(new Font("Arial", Font.PLAIN, 14));
@@ -522,31 +695,28 @@ public class Main {
 		stArea.setLineWrap(true);
 		stArea.setWrapStyleWord(true);
 
+		// make text area auto-scoll down when new data appears
+		DefaultCaret stAreaCaret = (DefaultCaret) stArea.getCaret();
+		stAreaCaret.setUpdatePolicy(DefaultCaret.ALWAYS_UPDATE);
+
 		/*JButton stClosePortButton = new JButton("Close port");
 		stClosePortButton.setFont(new Font("Arial", Font.BOLD, 14));*/
 
 		JScrollPane stAreaScrollPane = new JScrollPane(stArea);
 
-		JTextField stInputField = new JTextField(25);
+		JTextField stInputField = new JTextField(30);
 		stInputField.setFont(new Font("Arial", Font.PLAIN, 14));
 
 		JButton stSendButton = new JButton("Send");
 		stSendButton.setFont(new Font("Arial", Font.BOLD, 14));
 
 		stSendButton.addActionListener(e -> {
-			String cmd = stInputField.getText()+end_chars;
-			out.print(cmd);
+			String cmd = stInputField.getText();
+			out.print(cmd+end_chars);
 			out.flush();
 
-			stArea.append(cmd);
+			stArea.append(cmd+"\n");
 		});
-
-		stFrame.setLayout(new FlowLayout(FlowLayout.LEFT));
-		stFrame.add(stAreaScrollPane);
-		stFrame.add(stInputField);
-		stFrame.add(stSendButton);
-
-		stFrame.setVisible(true);
 
 		SwingWorker sw1 = new SwingWorker<Void, Void>(){
 			@Override
@@ -591,6 +761,80 @@ public class Main {
 		});
 
 		sw1.execute();
+
+		JPanel stp1 = new JPanel(new BorderLayout());
+		stp1.add(stAreaScrollPane, BorderLayout.CENTER);
+
+		JPanel stp2 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		stp2.add(stInputField);
+		stp2.add(stSendButton);
+
+		stMainPanel.add(stp1);
+		stMainPanel.add(stp2);
+
+		stFrame.add(stMainPanel);
+
+		stFrame.setSize(500, 300);
+		stFrame.setLocationRelativeTo(null);
+		stFrame.setVisible(true);
+	}
+
+	private static Integer startSendSMS(SerialPort modemport, String number, String msg){
+
+		// function startSendSMS
+		// GUI mode: Uses SwingWorker to run sendSMS in the background and update the UI once the message has been sent. Returns null in any case.
+		// Terminal mode: Runs sendSMS and returns the message reference number. Returns null if encounters an error.
+
+		if(msg.length() > 160){
+			logError("Error: SMS message too long (over 160 characters)\n");
+			return null;
+		}
+
+		String number_nospaces = number.replace(" ", "");
+
+		if(!number_nospaces.matches("^\\+?[0-9]+$")){
+			logError("Error: Invalid phone number format.\n");
+			return null;
+		}
+
+		if(modemport == null){
+			logError("Error: No port selected.\n");
+			return null;
+		}
+
+		if(is_gui){
+			SwingWorker sw1 = new SwingWorker<Integer, String>(){
+				@Override
+				protected Integer doInBackground(){
+					publish("Sending...");
+					return sendSMS(modemport, number_nospaces, msg);
+				}
+
+				@Override
+				protected void process(List<String> chunks){
+					SMSSendButton.setText(chunks.get(chunks.size()-1));
+					SMSPanel.revalidate();
+					SMSPanel.repaint();
+				}
+
+				@Override
+				protected void done(){
+					try{
+						if(get() != null){
+							SMSSendButton.setText("Sent");
+						} else {
+							SMSSendButton.setText("Send");
+						}
+						SMSPanel.revalidate();
+						SMSPanel.repaint();
+					} catch (InterruptedException e){e.printStackTrace();} catch (ExecutionException e){e.printStackTrace();}
+				}
+			};
+			sw1.execute();
+			return null;
+		} else {
+			return sendSMS(modemport, number_nospaces, msg);
+		}
 	}
 
 	private static void configPort(SerialPort port, int baudrate){
@@ -620,19 +864,26 @@ public class Main {
 		// Prints an error if in terminal and displays error popup if in GUI.
 
 		if(is_gui){
-			JOptionPane.showMessageDialog(null, String.format(err_msg, extra_args), "Error", JOptionPane.ERROR_MESSAGE);
+			if(SwingUtilities.isEventDispatchThread()){
+				JOptionPane.showMessageDialog(null, String.format(err_msg, extra_args), "Error", JOptionPane.ERROR_MESSAGE);
+			} else {
+				SwingUtilities.invokeLater(() -> {
+					JOptionPane.showMessageDialog(null, String.format(err_msg, extra_args), "Error", JOptionPane.ERROR_MESSAGE);
+				});
+			}
 		} else {
 			System.err.printf(err_msg, extra_args);
 		}
 	}
 
-	public static int checkResponseOK(SerialPort modemport){
+	public static String checkResponse(SerialPort modemport, String expected_response, int timeout_ms){
 
-		// function checkResponseOK
-		// Returns 0 if modem responds with an OK, -1 if ERROR, and -2 if timeout occurs before
-		// any recognizeable modem response is detected. Also prints error messages accordingly.
+		// function checkResponse
+		// Returns null if modem reports and error or if timeout occurs before the expected response is detected.
+		// If the expected response is detected, then returns the line containing the expected response.
+		// Also prints error messages accordingly.
 
-		int timeout = 5000; // in milliseconds
+		int exp_resp_len = expected_response.length();
 		long cmd_sent_time = System.nanoTime();
 
 		while(true){
@@ -640,20 +891,29 @@ public class Main {
 				String[] input_lines = ModemUtil.serialReadLines(modemport);
 				if(input_lines.length > 0){
 					for(String s : input_lines){
-						if(s.length() >= 2 && s.substring(0,2).equals("OK")){
-							return 0;
-						} else if(s.length() >= 5 && s.substring(0,5).equals("ERROR")){
-							logError("Error: Modem reported an error.\n");
-							return -1;
+						if(s.length() >= exp_resp_len && s.substring(0,exp_resp_len).equals(expected_response)){
+							return s;
+						} else if(s.contains("ERROR")){
+							logError("Error: Modem reported an error: "+s+"\n");
+							return null;
 						}
 					}
 				}
 			}
-			if((System.nanoTime()-cmd_sent_time)/1000000 > timeout){
+			if((System.nanoTime()-cmd_sent_time)/1000000 > timeout_ms){
 				logError("Error: Modem timeout.\n");
-				return -2;
+				return null;
 			}
 		}
+	}
+
+	public static String checkResponse(SerialPort modemport, String expected_response){
+
+		// function checkResponse --- (for cases when timeout is not passed) ---
+		// Wrapper around checkResponse that passes a default timeout if no timeout is specified.
+
+		int modem_timeout_default_ms = 5000;	// in milliseconds
+		return checkResponse(modemport, expected_response, modem_timeout_default_ms);
 	}
 
 	private static String sendReceiveUSSD(SerialPort modemport, String ussd_code) {
@@ -661,122 +921,163 @@ public class Main {
 		// function sendReceiveUSSD
 		// Sends a USSD code and then returns the response. Returns null if encounters an error.
 
+		int ussd_timeout_ms = 10000; // in milliseconds
+		String reply = null;	// default value to return if error occurs
+
 		if(!modemport.openPort()){
 			logError("Error: Failed to open port "+modemport.getSystemPortName()+"\n");
 			return null;
 		}
 
 		configPort(modemport, baudrate);
-
 		PrintStream out = new PrintStream(modemport.getOutputStream());
 
 		// enable numeric error report
-		out.print("AT+CMEE=1\r\n");
+		out.print("AT+CMEE=1\r");
 		out.flush();
 
-		int ret = checkResponseOK(modemport);
-		if(ret < 0){
+		String resp = checkResponse(modemport, "OK");
+		if(resp == null){
 			out.close();
 			modemport.closePort();
 			return null;
 		}
 
 		// set text encoding to "GSM"
-		out.print("AT+CSCS=\"GSM\"\r\n");
+		out.print("AT+CSCS=\"GSM\"\r");
 		out.flush();
 
-		ret = checkResponseOK(modemport);
-		if(ret < 0){
+		resp = checkResponse(modemport, "OK");
+		if(resp == null){
 			out.close();
 			modemport.closePort();
 			return null;
 		}
+
+		logVerboseOutput("Sending USSD...\n");
 
 		// send USSD code
-		out.print("AT+CUSD=1,\""+ussd_code+"\",15\r\n");
+		out.print("AT+CUSD=1,\""+ussd_code+"\",15\r");
 		out.flush();
 
-		ret = checkResponseOK(modemport);
-		if(ret < 0){
+		resp = checkResponse(modemport, "OK");
+		if(resp == null){
 			out.close();
 			modemport.closePort();
 			return null;
 		}
 
-		int ussd_timeout = 10000; // in milliseconds
-		long msg_sent_time = System.nanoTime();
+		logVerboseOutput("Done\n");
 
-		String reply = null;	// default value to return if error occurs
-
-		// USSD reply waiting loop
-		replyScanLoop:
-		while(true){
-			if(modemport.bytesAvailable() > 0){
-				String[] input_lines = ModemUtil.serialReadLines(modemport);
-				if(input_lines.length > 0){
-					for(String s : input_lines){
-						if(s.length() >= 7 && s.substring(0,7).equals("+CUSD: ")){
-							String[] reply_items = s.substring(7).replace("\"", "").split(",");
-							// XXX TODO XXX --- Implement checking whether reply from user is needed
-							int reply_encoding = Integer.parseInt(reply_items[2]);
-							if(reply_encoding == 15){
-								reply = ModemUtil.decode7bitGSM(HexFormat.of().parseHex(reply_items[1]));
-							} else if (reply_encoding == 72){
-								reply = new String(HexFormat.of().parseHex(reply_items[1]), StandardCharsets.UTF_16BE);
-							}else{
-								logError("Error: USSD response uses an unrecognized encoding format: %d\n", reply_encoding);
-							}
-							break replyScanLoop;
-						} else if(s.length() >= 12 && s.substring(0,12).equals("+CME ERROR: ")){
-							logError("Error: Modem reported an error: "+s+"\n");
-							break replyScanLoop;
-						}
-					}
-				}
-			}
-			if((System.nanoTime()-msg_sent_time)/1000000 > ussd_timeout){
-				logError("Error: USSD timeout.\n");
-				break replyScanLoop;
-			}
+		resp = checkResponse(modemport, "+CUSD: ", ussd_timeout_ms);
+		if(resp == null){
+			out.close();
+			modemport.closePort();
+			return null;
 		}
+
+		String[] reply_items = resp.substring(7).replace("\"", "").split(",");
+		// XXX TODO XXX --- Implement checking whether reply from user is needed
+		int reply_encoding = Integer.parseInt(reply_items[2]);
+		if(reply_encoding == 15){
+			reply = ModemUtil.decode7BitGSM(HexFormat.of().parseHex(reply_items[1]));
+		} else if (reply_encoding == 72){
+			reply = new String(HexFormat.of().parseHex(reply_items[1]), StandardCharsets.UTF_16BE);
+		}else{
+			logError("Error: USSD response uses an unrecognized encoding format: %d\n", reply_encoding);
+		}
+
 		out.close();
 		modemport.closePort();
 		return reply;
 	}
 
-	private static Integer sendSMS(SerialPort modemport, String number, String msg){	// change return type?
+	private static Integer sendSMS(SerialPort modemport, String number, String msg){
+
+		// function send SMS
+		// Send an SMS to a specified number and returns the message reference number.
+		// Returns null if an error occurs.
+
+		int sms_timeout_ms = 10000;	// in milliseconds
+
 		if(!modemport.openPort()){
 			logError("Error: Failed to open port "+modemport.getSystemPortName()+"\n");
 			return null;
 		}
 
-		configPort(modemport, baudrate);
+		String pdu = null;
+		if(number.charAt(0) == '+'){
+			pdu = ModemUtil.encodePDU(number.substring(1), true, msg);
+		} else {
+			pdu = ModemUtil.encodePDU(number, false, msg);
+		}
 
+		configPort(modemport, baudrate);
 		PrintStream out = new PrintStream(modemport.getOutputStream());
 
 		// enable numeric error report
-		out.print("AT+CMEE=1\r\n");
+		out.print("AT+CMEE=1\r");
 		out.flush();
 
-		int ret = checkResponseOK(modemport);
-		if(ret < 0){
+		String resp = checkResponse(modemport, "OK");
+		if(resp == null){
+			out.close();
+			modemport.closePort();
+			return null;
+		}
+
+		// set text encoding to GSM
+		out.print("AT+CSCS=\"GSM\"\r");
+		out.flush();
+
+		resp = checkResponse(modemport, "OK");
+		if(resp == null){
 			out.close();
 			modemport.closePort();
 			return null;
 		}
 
 		// set PDU mode
-		out.print("AT+CMGF=0\r\n");
+		out.print("AT+CMGF=0\r");
 		out.flush();
 
-		ret = checkResponseOK(modemport);
-		if(ret < 0){
+		resp = checkResponse(modemport, "OK");
+		if(resp == null){
 			out.close();
 			modemport.closePort();
 			return null;
 		}
 
-		return 0;
+		// set length of PDU
+		out.printf("AT+CMGS=%d\r", pdu.length()/2 - 1);	// subtract 1 from length because the first byte (SMSC) is excluded from this length
+		out.flush();
+
+		resp = checkResponse(modemport, "> ");
+		if(resp == null){
+			out.close();
+			modemport.closePort();
+			return null;
+		}
+
+		// write the PDU + terminating character
+		out.print(pdu);
+		byte[] end = {0x1A};
+		modemport.writeBytes(end, 1);
+
+		logVerboseOutput("Sending SMS...\n");
+
+		resp = checkResponse(modemport, "+CMGS: ", sms_timeout_ms);
+		if(resp == null){
+			out.close();
+			modemport.closePort();
+			return null;
+		}
+
+		logVerboseOutput("Done\n");
+
+		out.close();
+		modemport.closePort();
+		return Integer.parseInt(resp.substring(7));
 	}
 
 	private static SerialPort[] scanForModemPorts(){
