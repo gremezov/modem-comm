@@ -963,7 +963,7 @@ public class Main {
 
 		JScrollPane stAreaScrollPane = new JScrollPane(stArea);
 
-		JTextField stInputField = new JTextField(50);
+		JTextField stInputField = new JTextField(40);
 		stInputField.setFont(new Font("Monospaced", Font.PLAIN, 14));
 
 		JButton stSendButton = new JButton("Send");
