@@ -64,7 +64,7 @@ public class Main {
 				formatter.printHelp("modemcomm", options);
 				System.exit(0);
 			}
-			if(cmdline.hasOption("verbose") ){//&& !is_gui){	// edit after debug
+			if(cmdline.hasOption("verbose") && !is_gui){
 				verbose_output = true;
 			}
 			if(cmdline.hasOption("end-chars")){
