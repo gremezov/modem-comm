@@ -1,6 +1,8 @@
 package io.github.gremezov.modemcomm;
 
 import com.fazecast.jSerialComm.SerialPort;
+import com.fazecast.jSerialComm.SerialPortDataListener;
+import com.fazecast.jSerialComm.SerialPortEvent;
 import org.apache.commons.cli.*;
 import javax.swing.*;
 import javax.swing.text.DefaultCaret;
@@ -18,6 +20,7 @@ import java.util.Scanner;
 import java.util.List;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.stream.IntStream;
 
 public class Main {
 
@@ -61,7 +64,7 @@ public class Main {
 				formatter.printHelp("modemcomm", options);
 				System.exit(0);
 			}
-			if(cmdline.hasOption("verbose") && !is_gui){
+			if(cmdline.hasOption("verbose") ){//&& !is_gui){	// edit after debug
 				verbose_output = true;
 			}
 			if(cmdline.hasOption("end-chars")){
@@ -192,7 +195,6 @@ public class Main {
 	private static JButton homeModemScanButton;
 	private static JLabel homeModemInfoLabel1;
 	private static JLabel homeModemInfoLabel2;
-	private static JLabel homeModemInfoLabel3;
 
 	// USSD screen
 	private static JPanel USSDPanel;
@@ -261,28 +263,22 @@ public class Main {
 		homeModemScanButton = new JButton("Detect Modems");
 		homeModemScanButton.setFont(new Font("Arial", Font.BOLD, 14));
 
-		JLabel homeModemInfoNameLabel1 = new JLabel("Modem - ");
+		JLabel homeModemInfoNameLabel1 = new JLabel("Manufacturer: ");
 		homeModemInfoNameLabel1.setFont(new Font("Arial", Font.BOLD, 14));
 		homeModemInfoLabel1 = new JLabel();
 		homeModemInfoLabel1.setFont(new Font("Arial", Font.PLAIN, 14));
 
-		JLabel homeModemInfoNameLabel2 = new JLabel("Manufacturer: ");
+		JLabel homeModemInfoNameLabel2 = new JLabel("Model: ");
 		homeModemInfoNameLabel2.setFont(new Font("Arial", Font.BOLD, 14));
 		homeModemInfoLabel2 = new JLabel();
 		homeModemInfoLabel2.setFont(new Font("Arial", Font.PLAIN, 14));
-
-		JLabel homeModemInfoNameLabel3 = new JLabel("Model: ");
-		homeModemInfoNameLabel3.setFont(new Font("Arial", Font.BOLD, 14));
-		homeModemInfoLabel3 = new JLabel();
-		homeModemInfoLabel3.setFont(new Font("Arial", Font.PLAIN, 14));
 
 		// set the default selected item to the currently used modem port and fill modem info
 		if(modemport != null){
 			homePortSelectorComboBox.setSelectedItem(modemport.getSystemPortName());
 
-			homeModemInfoLabel1.setText(modemport.getSystemPortName());
+			homeModemInfoLabel1.setText("---");
 			homeModemInfoLabel2.setText("---");
-			homeModemInfoLabel3.setText("---");
 			startGetInfo(modemport);
 		}
 
@@ -290,12 +286,14 @@ public class Main {
 			String selected_port_name = (String)homePortSelectorComboBox.getSelectedItem();
 			if(selected_port_name.equals(no_port_selected_str)){
 				modemport = null;
+
+				homeModemInfoLabel1.setText("");
+				homeModemInfoLabel2.setText("");
 			} else {
 				modemport = SerialPort.getCommPort(selected_port_name);
 
-				homeModemInfoLabel1.setText(modemport.getSystemPortName());
+				homeModemInfoLabel1.setText("---");
 				homeModemInfoLabel2.setText("---");
-				homeModemInfoLabel3.setText("---");
 				startGetInfo(modemport);
 			}
 		});
@@ -304,38 +302,31 @@ public class Main {
 			startScanForModemPorts();
 		});
 
-		JPanel hp1 = new JPanel(new FlowLayout(FlowLayout.CENTER));
+		JPanel hp1 = new JPanel(new FlowLayout(FlowLayout.LEFT));
 		hp1.add(homePortLabel);
 		hp1.add(homePortSelectorComboBox);
 		hp1.setBackground(homePanel.getBackground());
 
-		JPanel hp2 = new JPanel(new FlowLayout(FlowLayout.CENTER));
-		hp2.add(homeModemScanButton);
+		JPanel hp2 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		hp2.add(homeModemInfoNameLabel1);
+		hp2.add(homeModemInfoLabel1);
 		hp2.setBackground(homePanel.getBackground());
 
 		JPanel hp3 = new JPanel(new FlowLayout(FlowLayout.LEFT));
-		hp3.add(homeModemInfoNameLabel1);
-		hp3.add(homeModemInfoLabel1);
+		hp3.add(homeModemInfoNameLabel2);
+		hp3.add(homeModemInfoLabel2);
 		hp3.setBackground(homePanel.getBackground());
 
-		JPanel hp4 = new JPanel(new FlowLayout(FlowLayout.LEFT));
-		hp4.add(homeModemInfoNameLabel2);
-		hp4.add(homeModemInfoLabel2);
+		JPanel hp4 = new JPanel(new FlowLayout(FlowLayout.CENTER));
+		hp4.add(homeModemScanButton);
 		hp4.setBackground(homePanel.getBackground());
-
-		JPanel hp5 = new JPanel(new FlowLayout(FlowLayout.LEFT));
-		hp5.add(homeModemInfoNameLabel3);
-		hp5.add(homeModemInfoLabel3);
-		hp5.setBackground(homePanel.getBackground());
 
 		homePanelBox.add(Box.createVerticalStrut(30));
 		homePanelBox.add(hp1);
-		homePanelBox.add(Box.createVerticalStrut(30));
 		homePanelBox.add(hp2);
-		homePanelBox.add(Box.createVerticalStrut(30));
 		homePanelBox.add(hp3);
+		homePanelBox.add(Box.createVerticalStrut(30));
 		homePanelBox.add(hp4);
-		homePanelBox.add(hp5);
 
 		homePanel.add(homePanelBox, BorderLayout.PAGE_START);
 
@@ -551,6 +542,7 @@ public class Main {
 		terminalPanelBox.add(tp4);
 		terminalPanelBox.add(tp5);
 		terminalPanelBox.add(tp6);
+		terminalPanelBox.add(Box.createVerticalStrut(30));
 		terminalPanelBox.add(tp7);
 
 		terminalPanel.add(terminalPanelBox, BorderLayout.PAGE_START);
@@ -558,7 +550,7 @@ public class Main {
 		/* menu */
 
 		menuPanel = new JPanel();
-		menuPanel.setLayout(new FlowLayout(FlowLayout.LEFT));
+		menuPanel.setLayout(new FlowLayout(FlowLayout.LEFT, 7, 5));
 
 		homeMenuButton = new JButton("Home");
 		homeMenuButton.setFont(new Font("Arial", Font.BOLD, 14));
@@ -591,6 +583,30 @@ public class Main {
 			CardLayout cl = (CardLayout)mainPanel.getLayout();
 			cl.show(mainPanel, "terminalPanel");
 		});
+
+		Dimension maxMenuButtonSize = new Dimension(0, 0);
+
+		// get max width of all button widths
+		maxMenuButtonSize.width = IntStream.of(
+			homeMenuButton.getPreferredSize().width,
+			USSDMenuButton.getPreferredSize().width,
+			SMSMenuButton.getPreferredSize().width,
+			terminalMenuButton.getPreferredSize().width
+		).max().getAsInt();
+
+		// get max height of all button heights
+		maxMenuButtonSize.height = IntStream.of(
+			homeMenuButton.getPreferredSize().height,
+			USSDMenuButton.getPreferredSize().height,
+			SMSMenuButton.getPreferredSize().height,
+			terminalMenuButton.getPreferredSize().height
+		).max().getAsInt();
+
+		// set all button heights and widths to be that of the largest occuring button dimensions
+		homeMenuButton.setPreferredSize(maxMenuButtonSize);
+		USSDMenuButton.setPreferredSize(maxMenuButtonSize);
+		SMSMenuButton.setPreferredSize(maxMenuButtonSize);
+		terminalMenuButton.setPreferredSize(maxMenuButtonSize);
 
 		menuPanel.add(homeMenuButton);
 		menuPanel.add(USSDMenuButton);
@@ -823,8 +839,18 @@ public class Main {
 							DefaultComboBoxModel<String> newComboBoxModel = new DefaultComboBoxModel<>(modem_port_names);
 							homePortSelectorComboBox.setModel(newComboBoxModel);
 
-							// XXX --- TODO: if modemport has already been selected previously, then include it in the above list and also make it the
-							// currently selected item?
+							// If a serial port was previously selected and if it still exists in the current modem port list then make it
+							// the currently selected item in the combo box. If it doesn't exist in the new list, then deselect it.
+							if(modemport != null){
+								String existing_port_name = modemport.getSystemPortName();
+								if(Arrays.asList(modem_port_names).contains(existing_port_name)){
+									homePortSelectorComboBox.setSelectedItem(existing_port_name);
+								} else {
+									modemport = null;	// if the previously selected port does not exit in the current modem port list then de-select it
+									homeModemInfoLabel1.setText("");
+									homeModemInfoLabel2.setText("");
+								}
+							}
 
 							// form a string with all the port names and display to user
 							String names = String.join(", ", Arrays.copyOfRange(modem_port_names, 1, modem_port_names.length));
@@ -848,6 +874,9 @@ public class Main {
 
 	private static void startGetInfo(SerialPort modemport){
 
+		// function startGetInfo
+		// Uses SwingWorker to get modem info with modem.getInfo() and updates the info display on the home screen.
+
 		if(!modemport.openPort()){
 			return;
 		}
@@ -865,8 +894,8 @@ public class Main {
 			protected void done(){
 				try{
 					HashMap<String, String> info = get();
-					if(info.get("Manufacturer") != null) homeModemInfoLabel2.setText(info.get("Manufacturer"));
-					if(info.get("Model") != null) homeModemInfoLabel3.setText(info.get("Model"));
+					if(info.get("Manufacturer") != null) homeModemInfoLabel1.setText(info.get("Manufacturer"));
+					if(info.get("Model") != null) homeModemInfoLabel2.setText(info.get("Model"));
 					homePanel.revalidate();
 					homePanel.repaint();
 				} catch (InterruptedException e){e.printStackTrace();} catch (ExecutionException e){e.printStackTrace();}
@@ -981,12 +1010,12 @@ public class Main {
 			@Override
 			protected Void doInBackground(){
 
-				while(!isCancelled()){
+				/*while(!isCancelled()){
 					if(port.bytesAvailable() > 0){
 						stArea.append(Serial.read(port));
 					}
-				}
-				/*port.addDataListener(new SerialPortDataListener(){
+				}*/
+				port.addDataListener(new SerialPortDataListener(){
 					@Override
 					public int getListeningEvents(){
 						return SerialPort.LISTENING_EVENT_DATA_AVAILABLE;
@@ -994,7 +1023,7 @@ public class Main {
 					@Override
 					public void serialEvent(SerialPortEvent event){
 						if(event.getEventType() == SerialPort.LISTENING_EVENT_DATA_AVAILABLE){
-							System.out.println(Serial.read(port));
+							stArea.append(Serial.read(port));
 						}
 					}
 				});
@@ -1003,7 +1032,7 @@ public class Main {
 					try{Thread.sleep(1000);}catch(InterruptedException exc){}
 				}
 
-				port.removeDataListener();*/
+				port.removeDataListener();
 
 				out.close();
 				port.closePort();
