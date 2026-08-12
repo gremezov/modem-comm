@@ -826,7 +826,7 @@ public class Main {
 					try{
 						SerialPort[] modem_ports = get();
 
-						if(modem_ports.length > 0){
+						if(modem_ports != null && modem_ports.length > 0){
 
 							// fill array with port names for the selector
 							String[] modem_port_names = new String[modem_ports.length+1];
